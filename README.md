@@ -1,5 +1,7 @@
 # CUA_Collector
 
+<video src="Demo.mp4" controls autoplay loop muted playsinline style="max-width: 100%; width: 100%; border-radius: 12px;"></video>
+
 `CUA_Collector` is a lightweight desktop data collection tool for Computer Use Agent workflows. It records UI interaction traces as paired screenshots around each user action:
 
 - `State_A`: screenshot before the action
@@ -91,6 +93,21 @@ Use this when you want to manually demonstrate a desktop workflow and save it as
 - action-conditioned screenshot datasets
 - task replay and annotation pipelines
 
+## Citation
+
+```bibtex
+@misc{dong2026cuacollector,
+  author = {Zihan Dong},
+  title = {CUA_Collector},
+  year = {2026},
+  note = {Computer Use Agent behavior collection demo}
+}
+```
+
 ## License
 
-No license file is included by default. Add one before broader reuse if you want to define redistribution terms.
+Commercial Use: let's discuss by puma122707@gmail.com. Especially Tencent, ByteDance, Huawei, please behave.
+
+Non-Commercial Use: free.
+
+Research Use: free.
