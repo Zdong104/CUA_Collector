@@ -13,5 +13,6 @@ Thumbs.db
 .vscode/
 
 data/
-Demo.mp4
+*.mp4
+
 

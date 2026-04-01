@@ -1,6 +1,7 @@
 # CUA_Collector
 
 ![Demo](Demo.gif)
+![WindowsDemo](WindowsDemo.gif)
 
 `CUA_Collector` is a lightweight desktop data collection tool for Computer Use Agent workflows. It records UI interaction traces as paired screenshots around each user action:
 
