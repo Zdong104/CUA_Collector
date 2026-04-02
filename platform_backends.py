@@ -127,18 +127,47 @@ class Screenshotter:
 # ============================================================
 
 class CursorTracker:
-    """Cross-platform cursor position tracking."""
+    """Cross-platform cursor position tracking.
+
+    On Wayland GNOME 49+, Shell.Eval is blocked and pynput returns stale
+    XWayland coords.  We solve this with a tiny GNOME Shell extension
+    (cursor-tracker@cua) that exposes global.get_pointer() over D-Bus.
+
+    Detection order on Wayland:
+      1. cursor-tracker@cua extension  (best, works on GNOME 45-49+)
+      2. org.gnome.Shell.Eval          (works on older GNOME with dev-tools)
+      3. pynput                        (broken on Wayland, last resort)
+    """
 
     def __init__(self):
         self.method = self._detect_method()
         print(f"  🖱️  Cursor tracking: {self.method}")
+        if self.method == 'pynput' and SESSION_TYPE.startswith('wayland'):
+            print("  ⚠️  pynput cursor tracking is unreliable on Wayland!")
+            print("     Install the CUA extension: see README or run setup_extension.sh")
 
     def _detect_method(self) -> str:
         if SESSION_TYPE in ('windows', 'macos', 'x11'):
             return 'pynput'
-        if 'gnome' in SESSION_TYPE and self._test_gnome_eval():
-            return 'gnome-eval'
+        # Wayland: try extension first, then gnome-eval, then pynput
+        if 'gnome' in SESSION_TYPE:
+            if self._test_cua_extension():
+                return 'cua-extension'
+            if self._test_gnome_eval():
+                return 'gnome-eval'
         return 'pynput'
+
+    def _test_cua_extension(self) -> bool:
+        try:
+            r = subprocess.run([
+                'gdbus', 'call', '--session',
+                '--dest', 'org.cua.CursorTracker',
+                '--object-path', '/org/cua/CursorTracker',
+                '--method', 'org.cua.CursorTracker.GetPosition',
+            ], capture_output=True, text=True, timeout=2)
+            return r.returncode == 0 and '(' in r.stdout
+        except Exception:
+            return False
 
     def _test_gnome_eval(self) -> bool:
         try:
@@ -147,30 +176,50 @@ class CursorTracker:
                 '--dest', 'org.gnome.Shell',
                 '--object-path', '/org/gnome/Shell',
                 '--method', 'org.gnome.Shell.Eval',
-                'global.get_pointer()'
+                'let [x,y]=global.get_pointer(); x+","+y'
             ], capture_output=True, text=True, timeout=3)
-            return r.returncode == 0 and 'true' in r.stdout.lower()
+            # Eval returns (true, 'x,y') on success, (false, '') on failure
+            return r.returncode == 0 and "(true," in r.stdout
         except Exception:
             return False
 
     def get_position(self) -> Tuple[int, int]:
+        if self.method == 'cua-extension':
+            return self._get_cua_extension()
         if self.method == 'gnome-eval':
-            return self._get_gnome()
+            return self._get_gnome_eval()
         return self._get_pynput()
 
-    def _get_gnome(self) -> Tuple[int, int]:
+    def _get_cua_extension(self) -> Tuple[int, int]:
+        try:
+            r = subprocess.run([
+                'gdbus', 'call', '--session',
+                '--dest', 'org.cua.CursorTracker',
+                '--object-path', '/org/cua/CursorTracker',
+                '--method', 'org.cua.CursorTracker.GetPosition',
+            ], capture_output=True, text=True, timeout=1)
+            if r.returncode == 0:
+                nums = re.findall(r'-?\d+', r.stdout)
+                if len(nums) >= 2:
+                    return (int(nums[0]), int(nums[1]))
+        except Exception:
+            pass
+        return (0, 0)
+
+    def _get_gnome_eval(self) -> Tuple[int, int]:
         try:
             r = subprocess.run([
                 'gdbus', 'call', '--session',
                 '--dest', 'org.gnome.Shell',
                 '--object-path', '/org/gnome/Shell',
                 '--method', 'org.gnome.Shell.Eval',
-                'global.get_pointer()'
+                'let [x,y]=global.get_pointer(); x+","+y'
             ], capture_output=True, text=True, timeout=2)
-            if r.returncode == 0:
-                nums = re.findall(r'\d+', r.stdout)
-                if len(nums) >= 2:
-                    return (int(nums[0]), int(nums[1]))
+            if r.returncode == 0 and "(true," in r.stdout:
+                # Output: (true, '1234,567')
+                match = re.search(r"'(\d+),(\d+)'", r.stdout)
+                if match:
+                    return (int(match.group(1)), int(match.group(2)))
         except Exception:
             pass
         return (0, 0)
@@ -262,15 +311,31 @@ class WaylandInputMonitor:
                     if key_event.keystate == 1 and key_event.scancode == ecodes.KEY_ESC:
                         threading.Thread(target=self.callbacks['on_hotkey_drop_action'], daemon=True).start()
 
-                    # Mouse button press
-                    if is_mouse and key_event.keystate == 1:
+                    # Modifiers / Special keys tracking
+                    special_keys = {
+                        ecodes.KEY_LEFTCTRL: 'ctrl_l',
+                        ecodes.KEY_RIGHTCTRL: 'ctrl_r',
+                        ecodes.KEY_LEFTSHIFT: 'shift_l',
+                        ecodes.KEY_RIGHTSHIFT: 'shift_r',
+                        ecodes.KEY_ESC: 'esc',
+                        ecodes.KEY_BACKSPACE: 'backspace',
+                        ecodes.KEY_ENTER: 'enter',
+                        ecodes.KEY_FN: 'fn',
+                    }
+                    if key_event.scancode in special_keys and key_event.keystate in (0, 1): # 0 is up, 1 is down
+                        if 'on_key_event' in self.callbacks:
+                            threading.Thread(target=self.callbacks['on_key_event'], args=(special_keys[key_event.scancode], key_event.keystate == 1), daemon=True).start()
+
+                    # Mouse button press/release
+                    if is_mouse:
                         btn_map = {
                             ecodes.BTN_LEFT: 'left',
                             ecodes.BTN_RIGHT: 'right',
                             ecodes.BTN_MIDDLE: 'middle',
                         }
-                        if key_event.scancode in btn_map:
-                            self.callbacks['on_mouse_click'](btn_map[key_event.scancode])
+                        if key_event.scancode in btn_map and key_event.keystate in (0, 1):
+                            if 'on_mouse_button' in self.callbacks:
+                                threading.Thread(target=self.callbacks['on_mouse_button'], args=(btn_map[key_event.scancode], key_event.keystate == 1), daemon=True).start()
 
                 elif event.type == ecodes.EV_REL and is_mouse:
                     if event.code in (ecodes.REL_WHEEL, getattr(ecodes, 'REL_WHEEL_HI_RES', 11)):
@@ -326,17 +391,41 @@ class PynputInputMonitor:
             elif key == keyboard.Key.f12:
                 threading.Thread(target=self.callbacks['on_hotkey_end_task'], daemon=True).start()
         # ESC (no Ctrl needed) to drop current action
-        if key == keyboard.Key.esc:
+        if getattr(key, 'name', '') == 'esc':
             threading.Thread(target=self.callbacks['on_hotkey_drop_action'], daemon=True).start()
+
+        key_name = self._map_pynput_key(key)
+        if key_name and 'on_key_event' in self.callbacks:
+            threading.Thread(target=self.callbacks['on_key_event'], args=(key_name, True), daemon=True).start()
 
     def _on_key_release(self, key):
         from pynput import keyboard
         if key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
             self._ctrl_pressed = False
+            
+        key_name = self._map_pynput_key(key)
+        if key_name and 'on_key_event' in self.callbacks:
+            threading.Thread(target=self.callbacks['on_key_event'], args=(key_name, False), daemon=True).start()
+
+    def _map_pynput_key(self, key):
+        from pynput import keyboard
+        mapping = {
+            keyboard.Key.ctrl_l: 'ctrl_l',
+            keyboard.Key.ctrl_r: 'ctrl_r',
+            keyboard.Key.shift_l: 'shift_l',
+            keyboard.Key.shift_r: 'shift_r',
+            keyboard.Key.esc: 'esc',
+            keyboard.Key.backspace: 'backspace',
+            keyboard.Key.enter: 'enter',
+        }
+        if key in mapping:
+            return mapping[key]
+        return None
 
     def _on_click(self, x, y, button, pressed):
-        if pressed:
-            self.callbacks['on_mouse_click'](button.name if hasattr(button, 'name') else str(button))
+        btn_name = button.name if hasattr(button, 'name') else str(button)
+        if 'on_mouse_button' in self.callbacks:
+            threading.Thread(target=self.callbacks['on_mouse_button'], args=(btn_name, pressed), daemon=True).start()
 
     def _on_scroll(self, x, y, dx, dy):
         self.callbacks['on_mouse_scroll'](dx, dy)

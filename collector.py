@@ -85,6 +85,7 @@ class DataStore:
 
     def save_task(self, task: TaskRecord):
         task_dir = self.base_dir / task.task_id
+        task_dir.mkdir(parents=True, exist_ok=True)
         with open(task_dir / 'task.json', 'w') as f:
             json.dump(asdict(task), f, indent=2, default=str)
 
@@ -284,12 +285,14 @@ class Collector:
 
         # Action capture state
         self._timer: Optional[threading.Timer] = None
-        self._action_type: Optional[str] = None
-        self._action_coords: Tuple[int, int] = (0, 0)
-        self._action_details: dict = {}
         self._pre_ss_name: Optional[str] = None
         self._pre_ss_time: Optional[str] = None
         self._action_time: Optional[str] = None
+        
+        self._active_keys = {}
+        self._active_mouse_buttons = {}
+        self._completed_key_actions = []
+        self._completed_mouse_actions = []
         self._scroll_acc = {'dx': 0, 'dy': 0}
 
         self._lock = threading.Lock()
@@ -301,7 +304,8 @@ class Collector:
             'on_hotkey_screenshot': self._on_screenshot,
             'on_hotkey_end_task': self._on_end_task,
             'on_hotkey_drop_action': self._on_drop_action,
-            'on_mouse_click': self._on_click,
+            'on_mouse_button': self._on_mouse_button,
+            'on_key_event': self._on_key_event,
             'on_mouse_scroll': self._on_scroll,
         }
         if SESSION_TYPE.startswith('wayland'):
@@ -421,10 +425,13 @@ class Collector:
         with self._lock:
             self._pre_ss_name = name + '.png'
             self._pre_ss_time = datetime.now(timezone.utc).isoformat()
+            self._action_time = None
             self._scroll_acc = {'dx': 0, 'dy': 0}
+            self._completed_key_actions = []
+            self._completed_mouse_actions = []
             self.state = 'WAITING_ACTION'
 
-        print("   ✅ Saved. Now click or scroll… (ESC to cancel)")
+        print("   ✅ Saved. Now click, drag, or press special keys… (ESC to cancel)")
 
     def _on_drop_action(self):
         """ESC pressed: drop the current action capture and return to TASK_ACTIVE."""
@@ -467,48 +474,81 @@ class Collector:
         self.overlay.update_state('IDLE')
         print(f'\n🏁 Task "{desc}" ended. {n} actions recorded.\n')
 
-    # ---- mouse handlers ----
+    # ---- mouse/key handlers ----
 
-    def _on_click(self, button: str):
+    def _on_key_event(self, key_name: str, pressed: bool):
+        now = datetime.now(timezone.utc)
         with self._lock:
-            if self.state not in ('WAITING_ACTION', 'WAITING_TIMEOUT'):
-                return
-            coords = self.cursor.get_position()
-            self._action_type = 'click'
-            self._action_coords = coords
-            self._action_details = {'button': button}
-            self._action_time = datetime.now(timezone.utc).isoformat()
+            if pressed:
+                if key_name not in self._active_keys:
+                    self._active_keys[key_name] = now
+            else:
+                if key_name in self._active_keys:
+                    press_time = self._active_keys.pop(key_name)
+                    if self.state in ('WAITING_ACTION', 'WAITING_TIMEOUT'):
+                        delta_time = (now - press_time).total_seconds()
+                        self._completed_key_actions.append({
+                            'key': key_name,
+                            'press_time': press_time.isoformat(),
+                            'release_time': now.isoformat(),
+                            'delta_time': delta_time
+                        })
+                        if not self._action_time:
+                            self._action_time = press_time.isoformat()
 
-        print(f"   🖱️  Click ({button}) @ ({coords[0]}, {coords[1]})")
-        self._reset_timer()
+            if self.state in ('WAITING_ACTION', 'WAITING_TIMEOUT'):
+                self._reset_timer_if_idle()
+
+    def _on_mouse_button(self, button: str, pressed: bool):
+        now = datetime.now(timezone.utc)
+        coords = self.cursor.get_position()
+        with self._lock:
+            if pressed:
+                if button not in self._active_mouse_buttons:
+                    self._active_mouse_buttons[button] = {'coords': coords, 'time': now}
+            else:
+                if button in self._active_mouse_buttons:
+                    down_info = self._active_mouse_buttons.pop(button)
+                    if self.state in ('WAITING_ACTION', 'WAITING_TIMEOUT'):
+                        press_time = down_info['time']
+                        delta_time = (now - press_time).total_seconds()
+                        self._completed_mouse_actions.append({
+                            'button': button,
+                            'press_coords': down_info['coords'],
+                            'release_coords': coords,
+                            'press_time': press_time.isoformat(),
+                            'release_time': now.isoformat(),
+                            'delta_time': delta_time
+                        })
+                        if not self._action_time:
+                            self._action_time = press_time.isoformat()
+            
+            if self.state in ('WAITING_ACTION', 'WAITING_TIMEOUT'):
+                self._reset_timer_if_idle()
 
     def _on_scroll(self, dx: int, dy: int):
         with self._lock:
             if self.state not in ('WAITING_ACTION', 'WAITING_TIMEOUT'):
                 return
-            coords = self.cursor.get_position()
             self._scroll_acc['dx'] += dx
             self._scroll_acc['dy'] += dy
-            self._action_type = 'scroll'
-            self._action_coords = coords
-            self._action_details = {
-                'dx_total': self._scroll_acc['dx'],
-                'dy_total': self._scroll_acc['dy'],
-                'direction': 'down' if self._scroll_acc['dy'] < 0 else 'up' if self._scroll_acc['dy'] > 0 else 'horizontal',
-            }
-            if self.state == 'WAITING_ACTION':
+            if not self._action_time:
                 self._action_time = datetime.now(timezone.utc).isoformat()
-
-        self._reset_timer()
+            self._reset_timer_if_idle()
 
     # ---- debounce ----
 
-    def _reset_timer(self):
-        with self._lock:
-            if self._timer:
-                self._timer.cancel()
-            self.state = 'WAITING_TIMEOUT'
+    def _reset_timer_if_idle(self):
+        if self._timer:
+            self._timer.cancel()
+            self._timer = None
 
+        if self._active_mouse_buttons or self._active_keys:
+            self.state = 'WAITING_TIMEOUT'
+            self.overlay.update_state('WAITING_TIMEOUT', 'Holding…')
+            return
+
+        self.state = 'WAITING_TIMEOUT'
         self.overlay.update_state('WAITING_TIMEOUT', '⏳ 0.5s')
         self._timer = threading.Timer(self.DEBOUNCE_SEC, self._on_timer_done)
         self._timer.start()
@@ -520,6 +560,33 @@ class Collector:
                 return
             seq = self.seq
             tid = self.current_task.task_id
+
+            action_type = "unknown"
+            action_coords = self.cursor.get_position()
+            
+            if self._completed_mouse_actions:
+                act = self._completed_mouse_actions[0]
+                dx = abs(act['release_coords'][0] - act['press_coords'][0])
+                dy = abs(act['release_coords'][1] - act['press_coords'][1])
+                if dx > 3 or dy > 3 or act['delta_time'] > 0.3:
+                    action_type = "drag"
+                else:
+                    action_type = "click"
+                action_coords = act['press_coords']
+            elif self._scroll_acc['dx'] != 0 or self._scroll_acc['dy'] != 0:
+                action_type = "scroll"
+            elif self._completed_key_actions:
+                action_type = "hotkey"
+
+            action_details = {
+                'mouse': self._completed_mouse_actions,
+                'keys': self._completed_key_actions,
+                'scroll': {
+                    'dx_total': self._scroll_acc['dx'],
+                    'dy_total': self._scroll_acc['dy'],
+                    'direction': 'down' if self._scroll_acc['dy'] < 0 else 'up' if self._scroll_acc['dy'] > 0 else 'horizontal' if self._scroll_acc['dx'] != 0 else 'none'
+                }
+            }
 
         name = f"action_{seq:04d}_after"
         path = self.data_store.screenshot_path(tid, name)
@@ -539,9 +606,9 @@ class Collector:
                 elapsed_since_task_start=time.monotonic() - self.task_start_mono,
                 pre_screenshot=self._pre_ss_name,
                 post_screenshot=(name + '.png') if ok else 'FAILED',
-                action_type=self._action_type,
-                action_coords=self._action_coords,
-                action_details=self._action_details,
+                action_type=action_type,
+                action_coords=action_coords,
+                action_details=action_details,
                 os_name=OS_NAME,
                 session_type=SESSION_TYPE,
                 screen_resolution=self.resolution,
@@ -551,7 +618,8 @@ class Collector:
             self.state = 'TASK_ACTIVE'
 
         self.overlay.update_state('TASK_ACTIVE', f'#{seq} ✓')
-        print(f"   ✅ Action #{seq} recorded: {self._action_type} @ {self._action_coords}")
+        print(f"   ✅ Action #{seq} recorded: {action_type} @ {action_coords}")
+        print(f"      (Keys: {[k['key'] for k in action_details['keys']]}, Mouse: {[m['button'] for m in action_details['mouse']]})")
         print("   Press Ctrl+F9 for next action, or Ctrl+F12 to end task.\n")
 
 
