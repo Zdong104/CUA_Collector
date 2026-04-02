@@ -278,6 +278,12 @@ class Collector:
         self.overlay = StatusOverlay()
         self.resolution = get_screen_resolution()
 
+        # If the CUA extension reports native pixel resolution, prefer that
+        # (it matches the PipeWire screenshot dimensions exactly)
+        native_res = self.cursor.get_monitor_native_resolution()
+        if native_res:
+            self.resolution = native_res
+
         # Task state
         self.current_task: Optional[TaskRecord] = None
         self.seq = 0

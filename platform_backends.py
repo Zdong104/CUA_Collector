@@ -42,21 +42,85 @@ OS_NAME, SESSION_TYPE = detect_platform()
 
 
 def get_screen_resolution() -> Tuple[int, int]:
-    """Get primary screen resolution."""
+    """Get the resolution of the current/primary monitor (not the combined virtual desktop).
+
+    On multi-monitor setups the combined virtual desktop (e.g. 9840x3840) differs
+    from the individual monitor resolution (e.g. 3840x2400).  Since screenshots
+    and cursor coordinates are relative to a single monitor, we need the latter.
+    """
     try:
         if SESSION_TYPE in ('windows', 'macos', 'x11'):
             import mss
             with mss.mss() as sct:
-                m = sct.monitors[0]
+                # monitors[0] is the combined virtual screen; monitors[1] is the primary
+                if len(sct.monitors) > 1:
+                    m = sct.monitors[1]  # primary monitor
+                else:
+                    m = sct.monitors[0]
                 return (m['width'], m['height'])
-        # Wayland: try xrandr or GNOME Shell
-        r = subprocess.run(['xrandr', '--current'], capture_output=True, text=True, timeout=3)
-        if r.returncode == 0:
-            match = re.search(r'current\s+(\d+)\s*x\s*(\d+)', r.stdout)
-            if match:
-                return (int(match.group(1)), int(match.group(2)))
     except Exception:
         pass
+
+    # Wayland: try multiple methods to get the primary monitor resolution
+    # Method 1: Parse individual monitor outputs from xrandr
+    try:
+        r = subprocess.run(['xrandr', '--current'], capture_output=True, text=True, timeout=3)
+        if r.returncode == 0:
+            best_res = None
+            in_connected_output = False
+            is_primary = False
+            for line in r.stdout.splitlines():
+                if ' connected' in line:
+                    in_connected_output = True
+                    is_primary = 'primary' in line
+                    header_match = re.search(r'(\d{3,5})x(\d{3,5})\+', line)
+                    if header_match:
+                        res = (int(header_match.group(1)), int(header_match.group(2)))
+                        if is_primary or best_res is None:
+                            best_res = res
+                            if is_primary:
+                                break
+                elif ' disconnected' in line:
+                    in_connected_output = False
+                    is_primary = False
+                elif in_connected_output and '*' in line:
+                    mode_match = re.match(r'\s+(\d{3,5})x(\d{3,5})', line)
+                    if mode_match:
+                        res = (int(mode_match.group(1)), int(mode_match.group(2)))
+                        if is_primary or best_res is None:
+                            best_res = res
+                            if is_primary:
+                                break
+            if best_res:
+                return best_res
+    except Exception:
+        pass
+
+    # Method 2: Try gnome-randr (available on some GNOME Wayland setups)
+    try:
+        r = subprocess.run(['gnome-randr'], capture_output=True, text=True, timeout=3)
+        if r.returncode == 0:
+            # Look for active mode line, e.g. "  3840x2400@60.000  *"
+            for line in r.stdout.splitlines():
+                if '*' in line:
+                    m = re.search(r'(\d{3,5})x(\d{3,5})', line)
+                    if m:
+                        return (int(m.group(1)), int(m.group(2)))
+    except Exception:
+        pass
+
+    # Method 3: Try wlr-randr (wlroots compositors like Sway)
+    try:
+        r = subprocess.run(['wlr-randr'], capture_output=True, text=True, timeout=3)
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                if 'current' in line.lower():
+                    m = re.search(r'(\d{3,5})x(\d{3,5})', line)
+                    if m:
+                        return (int(m.group(1)), int(m.group(2)))
+    except Exception:
+        pass
+
     return (1920, 1080)
 
 
@@ -129,33 +193,286 @@ class Screenshotter:
 class CursorTracker:
     """Cross-platform cursor position tracking.
 
-    On Wayland GNOME 49+, Shell.Eval is blocked and pynput returns stale
-    XWayland coords.  We solve this with a tiny GNOME Shell extension
-    (cursor-tracker@cua) that exposes global.get_pointer() over D-Bus.
+    On Wayland GNOME, cursor coordinates from global.get_pointer() are in the
+    global *logical* coordinate space spanning all monitors.  Screenshots are
+    captured at the monitor's *native pixel* resolution.
+
+    With the v2 CUA extension (GetPositionPixel), coordinates are already
+    converted to monitor-relative pixel space.  For fallback methods (gnome-eval,
+    v1 extension), we read the primary monitor's offset and scale from
+    monitors.xml and transform coordinates in Python.
 
     Detection order on Wayland:
-      1. cursor-tracker@cua extension  (best, works on GNOME 45-49+)
-      2. org.gnome.Shell.Eval          (works on older GNOME with dev-tools)
-      3. pynput                        (broken on Wayland, last resort)
+      1. cursor-tracker@cua extension v2 (GetPositionPixel – best)
+      2. cursor-tracker@cua extension v1 (GetPosition + Python transform)
+      3. org.gnome.Shell.Eval            (+ Python transform)
+      4. pynput                          (broken on Wayland, last resort)
     """
 
     def __init__(self):
+        self._pixel_method = False  # True if using GetPositionPixel
+        self._monitor_native_res = None  # (w, h) in native pixels
+        # Monitor geometry for coordinate transform (v1 fallback)
+        self._monitor_offset = (0, 0)  # (x, y) logical offset in compositor
+        self._monitor_logical_size = None  # (w, h) logical size
+        self._monitor_scale = 1.0  # scale factor (native / logical)
+        self._load_monitor_geometry()
+
         self.method = self._detect_method()
-        print(f"  🖱️  Cursor tracking: {self.method}")
+        print(f"  🖱️  Cursor tracking: {self.method}"
+              + (" (pixel coords)" if self._pixel_method else ""))
+        if not self._pixel_method and self._monitor_scale != 1.0:
+            print(f"  📐 Monitor offset: {self._monitor_offset}, "
+                  f"scale: {self._monitor_scale}x "
+                  f"(native: {self._monitor_native_res})")
         if self.method == 'pynput' and SESSION_TYPE.startswith('wayland'):
             print("  ⚠️  pynput cursor tracking is unreliable on Wayland!")
             print("     Install the CUA extension: see README or run setup_extension.sh")
+
+    def _load_monitor_geometry(self):
+        """Detect primary monitor geometry from the running GNOME compositor.
+
+        Uses org.gnome.Mutter.DisplayConfig.GetCurrentState D-Bus API which
+        returns the live monitor layout, including:
+         - logical offset (x, y) of each monitor in compositor space
+         - scale factor (e.g. 2.0 for HiDPI)
+         - primary flag
+         - connected output names
+
+        Falls back to parsing monitors.xml if D-Bus is unavailable.
+        """
+        if not SESSION_TYPE.startswith('wayland'):
+            return
+
+        # Try live D-Bus query first (most reliable)
+        if self._load_from_mutter_dbus():
+            return
+
+        # Fallback: parse monitors.xml
+        self._load_from_monitors_xml()
+
+    def _load_from_mutter_dbus(self) -> bool:
+        """Load monitor geometry from org.gnome.Mutter.DisplayConfig.GetCurrentState."""
+        try:
+            r = subprocess.run([
+                'gdbus', 'call', '--session',
+                '--dest', 'org.gnome.Mutter.DisplayConfig',
+                '--object-path', '/org/gnome/Mutter/DisplayConfig',
+                '--method', 'org.gnome.Mutter.DisplayConfig.GetCurrentState',
+            ], capture_output=True, text=True, timeout=5)
+            if r.returncode != 0:
+                return False
+
+            text = r.stdout
+
+            # Parse logical monitors section: [(x, y, scale, transform, primary, [(connector, vendor, product, serial)], props), ...]
+            # We look for the primary monitor (has 'true' after the transform uint32)
+            # Pattern: (x, y, scale, uint32 N, true, [('connector', ...
+            primary_match = re.search(
+                r'\((\d+),\s*(\d+),\s*([\d.]+),\s*(?:uint32\s+)?\d+,\s*true,\s*\[\(\'([^\']+)\'',
+                text
+            )
+            if not primary_match:
+                return False
+
+            offset_x = int(primary_match.group(1))
+            offset_y = int(primary_match.group(2))
+            scale = float(primary_match.group(3))
+            connector = primary_match.group(4)
+
+            self._monitor_offset = (offset_x, offset_y)
+            self._monitor_scale = scale
+
+            # Now find the monitor mode resolution for this connector
+            # Monitors section has: ('connector', 'vendor', 'product', 'serial'), [modes...], properties
+            # Find the active mode for this connector by looking for a mode with 'is-current' property
+            # For simplicity, parse the connector's mode width/height from the output
+            # The mode entries look like: ('WxH@rate', W, H, rate, preferred_scale, ...)
+            # Find the connector section and its first (native) mode
+            connector_pattern = rf"'{re.escape(connector)}'"
+            conn_idx = text.find(connector_pattern)
+            if conn_idx > 0:
+                # Find modes after this connector - look for WxH patterns
+                # The first mode after 'is-builtin' property is usually the list
+                # Find active mode width/height - look for resolution modes
+                modes_text = text[conn_idx:]
+                # Find the first mode entry: ('3840x2400@60.002', 3840, 2400, ...)
+                mode_match = re.search(r"\('(\d+)x(\d+)@[\d.]+',\s*\d+,\s*\d+", modes_text)
+                if mode_match:
+                    native_w = int(mode_match.group(1))
+                    native_h = int(mode_match.group(2))
+                    self._monitor_native_res = (native_w, native_h)
+
+            # If we couldn't parse native resolution from modes, compute it from scale
+            if not self._monitor_native_res and scale > 1.0:
+                # We need the logical size - try to compute from scale
+                # Look at xrandr for the mode if available
+                native = self._get_native_resolution_xrandr(connector)
+                if native:
+                    self._monitor_native_res = native
+                    # Recalculate scale based on native vs logical
+                    # logical_width = native_width / scale
+                else:
+                    # Can't determine native, but we have offset and scale
+                    pass
+
+            print(f"  📐 Primary monitor ({connector}): "
+                  f"offset=({offset_x},{offset_y}), scale={scale}x"
+                  + (f", native={self._monitor_native_res[0]}×{self._monitor_native_res[1]}"
+                     if self._monitor_native_res else ""))
+            return True
+
+        except Exception as e:
+            print(f"  ⚠️  Mutter D-Bus query failed: {e}")
+            return False
+
+    def _load_from_monitors_xml(self):
+        """Fallback: parse monitors.xml to get primary monitor geometry."""
+        import xml.etree.ElementTree as ET
+        monitors_xml = os.path.expanduser('~/.config/monitors.xml')
+        if not os.path.isfile(monitors_xml):
+            return
+
+        try:
+            tree = ET.parse(monitors_xml)
+            root = tree.getroot()
+
+            # Get currently connected monitors from sysfs
+            connected = set()
+            drm_dir = '/sys/class/drm'
+            if os.path.isdir(drm_dir):
+                for entry in os.listdir(drm_dir):
+                    status_file = os.path.join(drm_dir, entry, 'status')
+                    if os.path.isfile(status_file):
+                        try:
+                            with open(status_file) as f:
+                                if 'connected' == f.read().strip():
+                                    # Extract connector name: card0-DP-1 -> DP-1
+                                    parts = entry.split('-', 1)
+                                    if len(parts) > 1:
+                                        connected.add(parts[1])
+                        except Exception:
+                            pass
+
+            # Find the configuration matching currently connected monitors
+            best_config = None
+            for config in root.findall('configuration'):
+                config_connectors = set()
+                for lmon in config.findall('logicalmonitor'):
+                    conn_el = lmon.find('monitor/monitorspec/connector')
+                    if conn_el is not None:
+                        config_connectors.add(conn_el.text)
+                # Check for disabled monitors too
+                for disabled in config.findall('disabled'):
+                    conn_el = disabled.find('monitorspec/connector')
+                    if conn_el is not None:
+                        config_connectors.add(conn_el.text)
+
+                if config_connectors == connected or (connected and config_connectors.issuperset(connected)):
+                    best_config = config
+                    break
+
+            if not best_config:
+                # Fall back to last config
+                configs = root.findall('configuration')
+                if configs:
+                    best_config = configs[-1]
+
+            if not best_config:
+                return
+
+            # Find the primary monitor
+            for lmon in best_config.findall('logicalmonitor'):
+                primary_el = lmon.find('primary')
+                if primary_el is None or primary_el.text != 'yes':
+                    continue
+
+                x = int(lmon.find('x').text)
+                y = int(lmon.find('y').text)
+                self._monitor_offset = (x, y)
+
+                scale_el = lmon.find('scale')
+                config_scale = float(scale_el.text) if scale_el is not None else 1.0
+
+                mode = lmon.find('monitor/mode')
+                if mode is not None:
+                    logical_w = int(mode.find('width').text)
+                    logical_h = int(mode.find('height').text)
+                    self._monitor_logical_size = (logical_w, logical_h)
+
+                    connector = lmon.find('monitor/monitorspec/connector')
+                    if connector is not None:
+                        native = self._get_native_resolution_xrandr(connector.text)
+                        if native:
+                            self._monitor_native_res = native
+                            self._monitor_scale = native[0] / logical_w
+                        elif config_scale != 1.0:
+                            self._monitor_scale = config_scale
+                            self._monitor_native_res = (
+                                int(logical_w * config_scale),
+                                int(logical_h * config_scale),
+                            )
+                        else:
+                            self._monitor_native_res = (logical_w, logical_h)
+                break
+        except Exception as e:
+            print(f"  ⚠️  Could not parse monitors.xml: {e}")
+
+    def _get_native_resolution_xrandr(self, connector: str) -> Optional[Tuple[int, int]]:
+        """Try to get the native (max) resolution for a display connector via xrandr."""
+        try:
+            r = subprocess.run(['xrandr', '--current'], capture_output=True, text=True, timeout=3)
+            if r.returncode != 0:
+                return None
+            in_connector = False
+            for line in r.stdout.splitlines():
+                if line.startswith(connector + ' '):
+                    in_connector = True
+                    continue
+                elif not line.startswith(' ') and in_connector:
+                    break
+                elif in_connector:
+                    m = re.match(r'\s+(\d+)x(\d+)', line)
+                    if m:
+                        return (int(m.group(1)), int(m.group(2)))
+        except Exception:
+            pass
+        return None
 
     def _detect_method(self) -> str:
         if SESSION_TYPE in ('windows', 'macos', 'x11'):
             return 'pynput'
         # Wayland: try extension first, then gnome-eval, then pynput
         if 'gnome' in SESSION_TYPE:
+            if self._test_cua_pixel():
+                self._pixel_method = True
+                return 'cua-extension'
             if self._test_cua_extension():
                 return 'cua-extension'
             if self._test_gnome_eval():
                 return 'gnome-eval'
         return 'pynput'
+
+    def _test_cua_pixel(self) -> bool:
+        """Test if the v2 extension with GetPositionPixel is available."""
+        try:
+            r = subprocess.run([
+                'gdbus', 'call', '--session',
+                '--dest', 'org.cua.CursorTracker',
+                '--object-path', '/org/cua/CursorTracker',
+                '--method', 'org.cua.CursorTracker.GetPositionPixel',
+            ], capture_output=True, text=True, timeout=2)
+            if r.returncode == 0 and '(' in r.stdout:
+                # Parse the native monitor resolution from the response
+                nums = re.findall(r'-?\d+', r.stdout)
+                if len(nums) >= 4:
+                    self._monitor_native_res = (int(nums[2]), int(nums[3]))
+                    print(f"  📐 Monitor native resolution from extension: "
+                          f"{self._monitor_native_res[0]}×{self._monitor_native_res[1]}")
+                return True
+        except Exception:
+            pass
+        return False
 
     def _test_cua_extension(self) -> bool:
         try:
@@ -183,14 +500,50 @@ class CursorTracker:
         except Exception:
             return False
 
+    def get_monitor_native_resolution(self) -> Optional[Tuple[int, int]]:
+        """Return the native pixel resolution detected, or None."""
+        return self._monitor_native_res
+
+    def _transform_to_pixel(self, global_x: int, global_y: int) -> Tuple[int, int]:
+        """Transform global logical coordinates to monitor-relative pixel coordinates."""
+        # Subtract monitor offset to get monitor-relative logical coords
+        local_x = global_x - self._monitor_offset[0]
+        local_y = global_y - self._monitor_offset[1]
+        # Scale to native pixel coordinates
+        pixel_x = int(round(local_x * self._monitor_scale))
+        pixel_y = int(round(local_y * self._monitor_scale))
+        return (pixel_x, pixel_y)
+
     def get_position(self) -> Tuple[int, int]:
         if self.method == 'cua-extension':
-            return self._get_cua_extension()
+            if self._pixel_method:
+                return self._get_cua_pixel()
+            return self._get_cua_extension_transformed()
         if self.method == 'gnome-eval':
-            return self._get_gnome_eval()
+            return self._get_gnome_eval_transformed()
         return self._get_pynput()
 
-    def _get_cua_extension(self) -> Tuple[int, int]:
+    def _get_cua_pixel(self) -> Tuple[int, int]:
+        """Get monitor-relative pixel coordinates from v2 extension."""
+        try:
+            r = subprocess.run([
+                'gdbus', 'call', '--session',
+                '--dest', 'org.cua.CursorTracker',
+                '--object-path', '/org/cua/CursorTracker',
+                '--method', 'org.cua.CursorTracker.GetPositionPixel',
+            ], capture_output=True, text=True, timeout=1)
+            if r.returncode == 0:
+                nums = re.findall(r'-?\d+', r.stdout)
+                if len(nums) >= 4:
+                    # Update cached native resolution
+                    self._monitor_native_res = (int(nums[2]), int(nums[3]))
+                    return (int(nums[0]), int(nums[1]))
+        except Exception:
+            pass
+        return (0, 0)
+
+    def _get_cua_extension_transformed(self) -> Tuple[int, int]:
+        """Get global coords from v1 extension, then transform to pixel coords."""
         try:
             r = subprocess.run([
                 'gdbus', 'call', '--session',
@@ -201,12 +554,13 @@ class CursorTracker:
             if r.returncode == 0:
                 nums = re.findall(r'-?\d+', r.stdout)
                 if len(nums) >= 2:
-                    return (int(nums[0]), int(nums[1]))
+                    return self._transform_to_pixel(int(nums[0]), int(nums[1]))
         except Exception:
             pass
         return (0, 0)
 
-    def _get_gnome_eval(self) -> Tuple[int, int]:
+    def _get_gnome_eval_transformed(self) -> Tuple[int, int]:
+        """Get global coords from Shell.Eval, then transform to pixel coords."""
         try:
             r = subprocess.run([
                 'gdbus', 'call', '--session',
@@ -219,7 +573,8 @@ class CursorTracker:
                 # Output: (true, '1234,567')
                 match = re.search(r"'(\d+),(\d+)'", r.stdout)
                 if match:
-                    return (int(match.group(1)), int(match.group(2)))
+                    return self._transform_to_pixel(
+                        int(match.group(1)), int(match.group(2)))
         except Exception:
             pass
         return (0, 0)
